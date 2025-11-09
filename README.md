@@ -2,6 +2,9 @@
 
 Rust reimplementation of [lolcat](https://github.com/busyloop/lolcat) maintained by [skyline69](https://github.com/skyline69). It sticks to the standard library while matching the original help surface.
 
+<img width="791" height="635" alt="image" src="https://github.com/user-attachments/assets/150dc4ae-98d8-412a-881f-a80313ef4164" />
+
+
 ## Features
 
 - Streams stdin or multiple files (treating `-` as stdin) with the familiar rainbow gradient.
