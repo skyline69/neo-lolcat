@@ -1,0 +1,30 @@
+[package]
+name = "neo-lolcat"
+version = "0.1.0"
+edition = "2024"
+description = "Rust rewrite of lolcat from skyline69 – zero-dependency rainbow text with animations, tests, and CI."
+readme = "README.md"
+repository = "https://github.com/skyline69/neo-lolcat"
+homepage = "https://dasguney.com"
+documentation = "https://github.com/skyline69/neo-lolcat#readme"
+license = "BSD-3-Clause"
+authors = ["skyline69"]
+keywords = ["lolcat", "ansi", "terminal", "color", "cli"]
+categories = ["command-line-utilities"]
+rust-version = "1.91.0"
+publish = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+
+[[bin]]
+name = "lolcat"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
