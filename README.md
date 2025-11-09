@@ -13,6 +13,12 @@ Rust reimplementation of [lolcat](https://github.com/busyloop/lolcat) maintained
 - Handles `Broken pipe`/`SIGPIPE` situations gracefully so pipelines like `macchina | lolcat -t --animate 1 | head -n1` exit cleanly.
 - Includes unit and integration tests to lock in parser behavior and CLI regressions.
 
+## Installing
+Install with the following command:
+```bash
+cargo install neo-lolcat
+```
+
 ## Building
 
 ```bash
