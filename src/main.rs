@@ -1,11 +1,10 @@
 use std::{
     borrow::Cow,
     env,
-    f64::consts::PI,
     fs::File,
     io::{self, BufReader, IsTerminal, Read, Write},
     process, thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RESET: &str = "\x1b[0m";
@@ -15,6 +14,10 @@ const SAVE_CURSOR: &str = "\x1b7";
 const RESTORE_CURSOR: &str = "\x1b8";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
+const READ_CHUNK: usize = 64 * 1024;
+const PENDING_CAP: usize = 4096;
+const SHIFT_COS: f64 = -0.5;
+const SHIFT_SIN: f64 = 0.866_025_403_784_438_6;
 
 const HELP_TEXT: &str = r#"Usage: lolcat [OPTION]... [FILE]...
 
@@ -176,8 +179,20 @@ fn process_stream<R: Read>(
         return Ok(());
     }
 
+    if printer.cfg.animate {
+        process_stream_buffered(reader, writer, printer)
+    } else {
+        process_stream_streaming(reader, writer, printer)
+    }
+}
+
+fn process_stream_buffered<R: Read>(
+    reader: R,
+    writer: &mut dyn Write,
+    printer: &mut Printer,
+) -> Result<(), StreamError> {
     let mut reader = BufReader::new(reader);
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; READ_CHUNK];
     let mut line_buf = Vec::new();
     loop {
         let read = reader.read(&mut chunk).map_err(StreamError::from)?;
@@ -200,6 +215,88 @@ fn process_stream<R: Read>(
         if start < read {
             line_buf.extend_from_slice(&chunk[start..read]);
         }
+    }
+    printer.flush_pending(writer).map_err(StreamError::from)
+}
+
+fn process_stream_streaming<R: Read>(
+    mut reader: R,
+    writer: &mut dyn Write,
+    printer: &mut Printer,
+) -> Result<(), StreamError> {
+    let mut buffer = [0u8; READ_CHUNK + 4];
+    let mut carry = 0usize;
+
+    'outer: loop {
+        let read = reader
+            .read(&mut buffer[carry..])
+            .map_err(StreamError::from)?;
+        if read == 0 {
+            break;
+        }
+        let total = carry + read;
+        let mut offset = 0usize;
+
+        while offset < total {
+            match std::str::from_utf8(&buffer[offset..total]) {
+                Ok(valid) => {
+                    consume_segment(valid, printer, writer).map_err(StreamError::from)?;
+                    offset = total;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to > 0 {
+                        let slice = std::str::from_utf8(&buffer[offset..offset + valid_up_to])
+                            .expect("validator provided a valid prefix");
+                        consume_segment(slice, printer, writer).map_err(StreamError::from)?;
+                        offset += valid_up_to;
+                        continue;
+                    }
+                    if let Some(error_len) = err.error_len() {
+                        printer
+                            .write_replacement(writer)
+                            .map_err(StreamError::from)?;
+                        offset += error_len;
+                        continue;
+                    }
+                    carry = total - offset;
+                    buffer.copy_within(offset..total, 0);
+                    continue 'outer;
+                }
+            }
+        }
+        carry = 0;
+    }
+
+    if carry > 0 {
+        printer
+            .write_replacement(writer)
+            .map_err(StreamError::from)?;
+    }
+
+    printer.flush_pending(writer).map_err(StreamError::from)
+}
+
+fn consume_segment(
+    segment: &str,
+    printer: &mut Printer<'_>,
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    if segment.is_empty() {
+        return Ok(());
+    }
+    let mut start = 0;
+    for (idx, ch) in segment.char_indices() {
+        if ch == '\n' {
+            if idx > start {
+                printer.write_plain_segment(&segment[start..idx], writer)?;
+            }
+            printer.finish_line(writer)?;
+            start = idx + ch.len_utf8();
+        }
+    }
+    if start < segment.len() {
+        printer.write_plain_segment(&segment[start..], writer)?;
     }
     Ok(())
 }
@@ -517,6 +614,7 @@ enum RunStatus {
     Io(io::Error),
 }
 
+#[derive(Debug)]
 enum StreamError {
     BrokenPipe,
     Io(io::Error),
@@ -580,27 +678,39 @@ struct Printer<'a> {
     use_color: bool,
     color_mode: ColorMode,
     cursor_hidden: bool,
+    line_active: bool,
+    escape_state: EscapeState,
+    phase: RainbowState,
+    rot: RainbowRot,
+    buffer: SmallBuf,
 }
 
 impl<'a> Printer<'a> {
     fn new(cfg: &'a Config, use_color: bool, color_mode: ColorMode, offset: f64) -> Self {
+        let angle = cfg.freq * offset;
         Self {
             cfg,
             os: offset,
             use_color,
             color_mode,
             cursor_hidden: false,
+            line_active: false,
+            escape_state: EscapeState::Idle,
+            phase: RainbowState::from_angle(angle),
+            rot: RainbowRot::new(cfg.freq / cfg.spread),
+            buffer: SmallBuf::new(),
         }
     }
 
     fn finalize(&mut self, writer: &mut dyn Write) -> io::Result<()> {
         if self.cursor_hidden {
-            writer.write_all(SHOW_CURSOR.as_bytes())?;
+            self.buffer.push(writer, SHOW_CURSOR.as_bytes())?;
             self.cursor_hidden = false;
         }
         if self.use_color {
-            writer.write_all(RESET.as_bytes())?;
+            self.buffer.push(writer, RESET.as_bytes())?;
         }
+        self.buffer.flush(writer)?;
         writer.flush()
     }
 
@@ -636,24 +746,34 @@ impl<'a> Printer<'a> {
         writer: &mut dyn Write,
     ) -> io::Result<()> {
         if !self.cursor_hidden {
-            writer.write_all(HIDE_CURSOR.as_bytes())?;
+            self.buffer.push(writer, HIDE_CURSOR.as_bytes())?;
             self.cursor_hidden = true;
         }
-        writer.write_all(SAVE_CURSOR.as_bytes())?;
+        self.buffer.push(writer, SAVE_CURSOR.as_bytes())?;
         let original = self.os;
         let frames = self.cfg.duration;
+        let frame_time = Duration::from_secs_f64(1.0 / self.cfg.speed);
+        let mut next_frame = Instant::now();
         for _ in 0..frames {
-            writer.write_all(RESTORE_CURSOR.as_bytes())?;
+            self.buffer.push(writer, RESTORE_CURSOR.as_bytes())?;
             self.os += self.cfg.spread;
             self.print_plain_line(text, false, writer)?;
+            self.buffer.flush(writer)?;
             writer.flush()?;
-            thread::sleep(Duration::from_secs_f64(1.0 / self.cfg.speed));
+            next_frame += frame_time;
+            let now = Instant::now();
+            if next_frame > now {
+                thread::sleep(next_frame - now);
+            } else {
+                next_frame = now;
+            }
         }
         self.os = original;
         if had_newline {
-            writer.write_all(b"\n")?;
+            self.buffer.push(writer, b"\n")?;
             self.os += 1.0;
         }
+        self.buffer.flush(writer)?;
         Ok(())
     }
 
@@ -664,6 +784,7 @@ impl<'a> Printer<'a> {
         writer: &mut dyn Write,
     ) -> io::Result<()> {
         if !self.use_color {
+            self.buffer.flush(writer)?;
             writer.write_all(text.as_bytes())?;
             if had_newline {
                 writer.write_all(b"\n")?;
@@ -671,77 +792,317 @@ impl<'a> Printer<'a> {
             return Ok(());
         }
 
-        let mut local = 0.0;
-        let mut escape_buf = String::new();
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                escape_buf.push(ch);
-                capture_escape(&mut chars, &mut escape_buf);
+        self.line_active = false;
+        self.escape_state = EscapeState::Idle;
+        self.write_plain_segment(text, writer)?;
+        if had_newline {
+            self.finish_line(writer)?;
+        } else {
+            self.line_active = false;
+        }
+        self.escape_state = EscapeState::Idle;
+        Ok(())
+    }
+
+    fn write_plain_segment(&mut self, text: &str, writer: &mut dyn Write) -> io::Result<()> {
+        debug_assert!(self.use_color);
+        for ch in text.chars() {
+            if self.escape_state.is_active() {
+                self.feed_escape(ch, writer)?;
                 continue;
             }
-            if !escape_buf.is_empty() {
-                writer.write_all(escape_buf.as_bytes())?;
-                escape_buf.clear();
+            if ch == '\x1b' {
+                self.begin_escape(writer)?;
+                continue;
             }
-            match ch {
-                '\t' => {
-                    for _ in 0..8 {
-                        self.write_visible(' ', self.os + local, writer)?;
-                        local += 1.0 / self.cfg.spread;
-                    }
+            if ch == '\t' {
+                for _ in 0..8 {
+                    self.write_visible_char(' ', writer)?;
                 }
-                _ => {
-                    self.write_visible(ch, self.os + local, writer)?;
-                    local += 1.0 / self.cfg.spread;
-                }
+                continue;
             }
-        }
-        if !escape_buf.is_empty() {
-            writer.write_all(escape_buf.as_bytes())?;
-        }
-        if had_newline {
-            writer.write_all(b"\n")?;
-            self.os += 1.0;
+            self.write_visible_char(ch, writer)?;
         }
         Ok(())
     }
 
-    fn write_visible(&self, ch: char, offset: f64, writer: &mut dyn Write) -> io::Result<()> {
-        let (r, g, b) = rainbow(self.cfg.freq, offset);
+    fn write_visible_char(&mut self, ch: char, writer: &mut dyn Write) -> io::Result<()> {
+        self.ensure_line_active();
+        let (r, g, b) = self.phase.channels();
         let encoded = &mut [0u8; 4];
         let glyph = ch.encode_utf8(encoded);
-        match (self.cfg.invert, self.color_mode) {
-            (false, ColorMode::TrueColor) => {
-                write!(writer, "\x1b[38;2;{};{};{}m{glyph}{RESET_FG}", r, g, b)?;
-            }
-            (true, ColorMode::TrueColor) => {
-                write!(writer, "\x1b[48;2;{};{};{}m{glyph}{RESET_BG}", r, g, b)?;
-            }
-            (false, ColorMode::Ansi256) => {
+        let mut block = [0u8; 64];
+        let mut len = match (self.cfg.invert, self.color_mode) {
+            (invert, ColorMode::TrueColor) => build_truecolor_prefix(&mut block, invert, r, g, b),
+            (invert, ColorMode::Ansi256) => {
                 let idx = rgb_to_ansi256(r, g, b);
-                write!(writer, "\x1b[38;5;{idx}m{glyph}{RESET_FG}")?;
+                build_ansi_prefix(&mut block, invert, idx)
             }
-            (true, ColorMode::Ansi256) => {
-                let idx = rgb_to_ansi256(r, g, b);
-                write!(writer, "\x1b[48;5;{idx}m{glyph}{RESET_BG}")?;
-            }
+        };
+        block[len..len + glyph.len()].copy_from_slice(glyph.as_bytes());
+        len += glyph.len();
+        let reset = if self.cfg.invert {
+            RESET_BG.as_bytes()
+        } else {
+            RESET_FG.as_bytes()
+        };
+        block[len..len + reset.len()].copy_from_slice(reset);
+        len += reset.len();
+        self.buffer.push(writer, &block[..len])?;
+        self.phase.advance(self.rot);
+        Ok(())
+    }
+
+    fn finish_line(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        self.buffer.push(writer, b"\n")?;
+        self.os += 1.0;
+        self.line_active = false;
+        Ok(())
+    }
+
+    fn ensure_line_active(&mut self) {
+        if !self.line_active {
+            self.line_active = true;
+            self.phase.reset(self.cfg.freq * self.os);
+        }
+    }
+
+    fn begin_escape(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        self.buffer.push(writer, b"\x1b")?;
+        self.escape_state = EscapeState::Start;
+        Ok(())
+    }
+
+    fn feed_escape(&mut self, ch: char, writer: &mut dyn Write) -> io::Result<()> {
+        let mut buf = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut buf);
+        self.buffer.push(writer, encoded.as_bytes())?;
+        self.escape_state.advance(ch);
+        Ok(())
+    }
+
+    fn write_replacement(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        self.write_visible_char('\u{FFFD}', writer)
+    }
+
+    fn flush_pending(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        self.buffer.flush(writer)
+    }
+}
+
+fn build_truecolor_prefix(buf: &mut [u8], invert: bool, r: u8, g: u8, b: u8) -> usize {
+    let mut len = 0;
+    buf[len] = 0x1b;
+    len += 1;
+    buf[len] = b'[';
+    len += 1;
+    buf[len] = if invert { b'4' } else { b'3' };
+    len += 1;
+    buf[len] = b'8';
+    len += 1;
+    buf[len] = b';';
+    len += 1;
+    buf[len] = b'2';
+    len += 1;
+    buf[len] = b';';
+    len += 1;
+    len += append_decimal_u8(&mut buf[len..], r);
+    buf[len] = b';';
+    len += 1;
+    len += append_decimal_u8(&mut buf[len..], g);
+    buf[len] = b';';
+    len += 1;
+    len += append_decimal_u8(&mut buf[len..], b);
+    buf[len] = b'm';
+    len + 1
+}
+
+fn build_ansi_prefix(buf: &mut [u8], invert: bool, idx: u8) -> usize {
+    let mut len = 0;
+    buf[len] = 0x1b;
+    len += 1;
+    buf[len] = b'[';
+    len += 1;
+    buf[len] = if invert { b'4' } else { b'3' };
+    len += 1;
+    buf[len] = b'8';
+    len += 1;
+    buf[len] = b';';
+    len += 1;
+    buf[len] = b'5';
+    len += 1;
+    buf[len] = b';';
+    len += 1;
+    len += append_decimal_u8(&mut buf[len..], idx);
+    buf[len] = b'm';
+    len + 1
+}
+
+fn append_decimal_u8(dst: &mut [u8], value: u8) -> usize {
+    debug_assert!(dst.len() >= 3);
+    let hundreds = value / 100;
+    let tens = (value % 100) / 10;
+    let ones = value % 10;
+    let mut len = 0;
+    if hundreds != 0 {
+        dst[len] = b'0' + hundreds;
+        len += 1;
+        dst[len] = b'0' + tens;
+        len += 1;
+        dst[len] = b'0' + ones;
+        len += 1;
+    } else if tens != 0 {
+        dst[len] = b'0' + tens;
+        len += 1;
+        dst[len] = b'0' + ones;
+        len += 1;
+    } else {
+        dst[len] = b'0' + ones;
+        len += 1;
+    }
+    len
+}
+
+struct SmallBuf {
+    data: [u8; PENDING_CAP],
+    len: usize,
+}
+
+impl SmallBuf {
+    fn new() -> Self {
+        Self {
+            data: [0u8; PENDING_CAP],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, writer: &mut dyn Write, chunk: &[u8]) -> io::Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if chunk.len() >= self.data.len() {
+            self.flush(writer)?;
+            return writer.write_all(chunk);
+        }
+        if self.len + chunk.len() > self.data.len() {
+            self.flush(writer)?;
+        }
+        self.data[self.len..self.len + chunk.len()].copy_from_slice(chunk);
+        self.len += chunk.len();
+        Ok(())
+    }
+
+    fn flush(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        if self.len > 0 {
+            writer.write_all(&self.data[..self.len])?;
+            self.len = 0;
         }
         Ok(())
     }
 }
 
-fn rainbow(freq: f64, position: f64) -> (u8, u8, u8) {
-    fn channel(angle: f64) -> u8 {
-        (angle.sin() * 127.0 + 128.0).round().clamp(0.0, 255.0) as u8
+#[derive(Copy, Clone)]
+enum EscapeState {
+    Idle,
+    Start,
+    Csi,
+    Osc { saw_esc: bool },
+    StringTerm { saw_esc: bool },
+    Fe,
+}
+
+impl EscapeState {
+    fn is_active(self) -> bool {
+        !matches!(self, EscapeState::Idle)
     }
 
-    let angle = freq * position;
-    (
-        channel(angle),
-        channel(angle + (2.0 * PI / 3.0)),
-        channel(angle + (4.0 * PI / 3.0)),
-    )
+    fn advance(&mut self, ch: char) {
+        match self {
+            EscapeState::Idle => {}
+            EscapeState::Start => {
+                *self = match ch {
+                    '[' => EscapeState::Csi,
+                    ']' => EscapeState::Osc { saw_esc: false },
+                    'P' | 'X' | '^' | '_' => EscapeState::StringTerm { saw_esc: false },
+                    c if (' '..='/').contains(&c) => EscapeState::Fe,
+                    _ => EscapeState::Idle,
+                };
+            }
+            EscapeState::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    *self = EscapeState::Idle;
+                }
+            }
+            EscapeState::Osc { saw_esc } => {
+                if ch == '\u{07}' || (*saw_esc && ch == '\\') {
+                    *self = EscapeState::Idle;
+                    return;
+                }
+                *saw_esc = ch == '\x1b';
+            }
+            EscapeState::StringTerm { saw_esc } => {
+                if *saw_esc && ch == '\\' {
+                    *self = EscapeState::Idle;
+                    return;
+                }
+                *saw_esc = ch == '\x1b';
+            }
+            EscapeState::Fe => {
+                *self = EscapeState::Idle;
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct RainbowState {
+    sin: f64,
+    cos: f64,
+}
+
+impl RainbowState {
+    fn from_angle(angle: f64) -> Self {
+        let (sin, cos) = angle.sin_cos();
+        Self { sin, cos }
+    }
+
+    fn reset(&mut self, angle: f64) {
+        let (sin, cos) = angle.sin_cos();
+        self.sin = sin;
+        self.cos = cos;
+    }
+
+    fn advance(&mut self, rot: RainbowRot) {
+        let sin = self.sin * rot.cos + self.cos * rot.sin;
+        let cos = self.cos * rot.cos - self.sin * rot.sin;
+        self.sin = sin;
+        self.cos = cos;
+    }
+
+    fn channels(&self) -> (u8, u8, u8) {
+        (
+            encode_component(self.sin),
+            encode_component(self.sin * SHIFT_COS + self.cos * SHIFT_SIN),
+            encode_component(self.sin * SHIFT_COS - self.cos * SHIFT_SIN),
+        )
+    }
+}
+
+#[derive(Copy, Clone)]
+struct RainbowRot {
+    cos: f64,
+    sin: f64,
+}
+
+impl RainbowRot {
+    fn new(delta: f64) -> Self {
+        let (sin, cos) = delta.sin_cos();
+        Self { cos, sin }
+    }
+}
+
+fn encode_component(value: f64) -> u8 {
+    value.mul_add(127.0, 128.0).round().clamp(0.0, 255.0) as u8
 }
 
 fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
@@ -761,64 +1122,10 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     }
 }
 
-#[derive(Copy, Clone)]
-enum EscapeMode {
-    Csi,
-    Osc,
-    StringTerm,
-    Fe,
-    Single,
-}
-
-fn capture_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, buf: &mut String) {
-    let mode;
-    if let Some(&next) = chars.peek() {
-        mode = match next {
-            '[' => EscapeMode::Csi,
-            ']' => EscapeMode::Osc,
-            'P' | 'X' | '^' | '_' => EscapeMode::StringTerm,
-            c if (' '..='/').contains(&c) => EscapeMode::Fe,
-            _ => EscapeMode::Single,
-        };
-        buf.push(chars.next().unwrap());
-    } else {
-        return;
-    }
-
-    match mode {
-        EscapeMode::Csi => {
-            for ch in chars.by_ref() {
-                buf.push(ch);
-                if ('@'..='~').contains(&ch) {
-                    break;
-                }
-            }
-        }
-        EscapeMode::Osc | EscapeMode::StringTerm => {
-            let mut saw_esc = false;
-            for ch in chars.by_ref() {
-                buf.push(ch);
-                if ch == '\u{07}' {
-                    break;
-                }
-                if saw_esc && ch == '\\' {
-                    break;
-                }
-                saw_esc = ch == '\x1b';
-            }
-        }
-        EscapeMode::Fe => {
-            if let Some(ch) = chars.next() {
-                buf.push(ch);
-            }
-        }
-        EscapeMode::Single => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Read};
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -941,21 +1248,43 @@ mod tests {
     }
 
     #[test]
-    fn capture_escape_consumes_csi_sequences() {
-        let mut chars = "[31mZ".chars().peekable();
-        let mut buf = "\x1b".to_string();
-        capture_escape(&mut chars, &mut buf);
-        assert_eq!(buf, "\x1b[31m");
-        assert_eq!(chars.collect::<String>(), "Z");
+    fn streaming_preserves_escape_sequences() {
+        let cfg = Config {
+            force: true,
+            ..Config::default()
+        };
+        let mut printer = Printer::new(&cfg, true, ColorMode::Ansi256, 0.0);
+        let mut output = Vec::new();
+        let input = b"\x1b[31mhello\nworld";
+        let reader = Chunked::new(&input[..], 2);
+
+        process_stream_streaming(reader, &mut output, &mut printer).unwrap();
+
+        assert!(
+            output.windows(5).any(|w| w == b"\x1b[31m"),
+            "escape sequence missing in {:?}",
+            output
+        );
     }
 
     #[test]
-    fn capture_escape_consumes_osc_sequences() {
-        let mut chars = "]0;title\x07rest".chars().peekable();
-        let mut buf = "\x1b".to_string();
-        capture_escape(&mut chars, &mut buf);
-        assert_eq!(buf, "\x1b]0;title\u{07}");
-        assert_eq!(chars.collect::<String>(), "rest");
+    fn streaming_replaces_invalid_utf8() {
+        let cfg = Config {
+            force: true,
+            ..Config::default()
+        };
+        let mut printer = Printer::new(&cfg, true, ColorMode::Ansi256, 0.0);
+        let mut output = Vec::new();
+        let input = [0xFF, 0xFF, b'\n'];
+        let reader = Chunked::new(&input, 1);
+
+        process_stream_streaming(reader, &mut output, &mut printer).unwrap();
+
+        assert!(
+            output.windows(3).any(|w| w == &[0xEF, 0xBF, 0xBD]),
+            "replacement char missing in {:?}",
+            output
+        );
     }
 
     #[test]
@@ -964,5 +1293,34 @@ mod tests {
         assert_eq!(rgb_to_ansi256(0, 255, 0), 46);
         assert_eq!(rgb_to_ansi256(0, 0, 255), 21);
         assert_eq!(rgb_to_ansi256(128, 128, 128), 243);
+    }
+
+    struct Chunked<'a> {
+        data: &'a [u8],
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl<'a> Chunked<'a> {
+        fn new(data: &'a [u8], chunk: usize) -> Self {
+            Self {
+                data,
+                pos: 0,
+                chunk,
+            }
+        }
+    }
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let remaining = self.data.len() - self.pos;
+            let take = remaining.min(self.chunk).min(buf.len());
+            buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Ok(take)
+        }
     }
 }
